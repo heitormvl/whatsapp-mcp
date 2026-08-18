@@ -5,3 +5,4 @@ whatsapp.log
 *.exe~
 qr_raw.txt
 qr_code.png
+whatsapp-bridge/store/

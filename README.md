@@ -173,6 +173,24 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **transcribe_audio_message**: Download a voice/audio message and transcribe it to text locally
+
+### Local Audio Transcription
+
+`transcribe_audio_message` uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) to transcribe voice messages to text entirely on your machine - the audio is never sent to a third-party transcription API.
+
+- Runs on GPU automatically if a CUDA-capable NVIDIA GPU is available (falls back to CPU otherwise).
+- Requires `ffmpeg` to be installed (see Prerequisites) so it can decode WhatsApp's `.ogg`/Opus voice notes.
+- The first call downloads the Whisper model (`small` by default, ~500MB) from Hugging Face and caches it locally.
+- **GPU setup on Windows**: `ctranslate2` (the inference backend) needs cuBLAS/cuDNN. Rather than requiring a full CUDA Toolkit install, add the `gpu` extra when syncing the server's dependencies:
+
+  ```bash
+  cd whatsapp-mcp-server
+  uv sync --extra gpu
+  ```
+
+  This pulls the `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`/etc. pip wheels (a few GB) instead. `transcribe.py` registers their DLL directories at import time so no manual `PATH` changes are needed. Without the GPU extra, transcription still works, just on CPU.
+- To use a different model size/accuracy tradeoff, edit `MODEL_SIZE` in `whatsapp-mcp-server/transcribe.py` (`tiny`, `base`, `small`, `medium`, `large-v3`, ...).
 
 ### Chats Routed Through a LID (Linked ID)
 
@@ -224,6 +242,7 @@ By default, just the metadata of the media is stored in the local database. The 
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **`download_media`/`transcribe_audio_message` fails with "download failed with status code 403"**: the bridge was reconstructing the media download path from the message's URL and stripping the `oh`/`oe` auth-token query parameters WhatsApp's CDN requires. It now stores each media message's native `direct_path` (from the protobuf) at receive time and uses that instead. If you're hitting this on an older build, update and restart the bridge - messages received after the update will download correctly; very old ones may need to be re-synced.
 - **Claude Code (CLI/agent sessions)**: register the server with `claude mcp add --scope user whatsapp -- <path-to-uv> --directory <path-to-whatsapp-mcp-server> run main.py` instead of editing a JSON file by hand. `--scope user` makes it available to every Claude Code session on the machine.
 - **Newer unified Claude desktop apps (bundling "Cowork"/Claude Code)**: these may manage MCP connections through an in-app Connectors UI (Settings → Connectors) rather than reading `claude_desktop_config.json` directly. If adding the server via the config file doesn't make it show up in chat mode, check that settings screen for a "custom connector" / local command option instead.
 

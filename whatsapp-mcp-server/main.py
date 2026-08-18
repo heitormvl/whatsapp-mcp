@@ -14,6 +14,7 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from transcribe import transcribe as transcribe_audio_file
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -249,6 +250,29 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def transcribe_audio_message(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Download a WhatsApp voice/audio message and transcribe it to text locally.
+
+    Uses faster-whisper (GPU-accelerated when a CUDA GPU is available) - the
+    audio never leaves this machine. Works on voice notes and regular audio
+    files (.ogg/.opus/.mp3/etc, anything ffmpeg can decode).
+
+    Args:
+        message_id: The ID of the message containing the audio
+        chat_jid: The JID of the chat containing the message
+    """
+    file_path = whatsapp_download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "message": "Failed to download audio message"}
+
+    try:
+        text = transcribe_audio_file(file_path)
+    except Exception as e:
+        return {"success": False, "message": f"Transcription failed: {e}"}
+
+    return {"success": True, "file_path": file_path, "text": text}
 
 if __name__ == "__main__":
     # Initialize and run the server
