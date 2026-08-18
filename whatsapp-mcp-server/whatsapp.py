@@ -8,7 +8,36 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+DEVICE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+def _resolve_jid_variants(identifier: str) -> List[str]:
+    """Expand a phone number or JID into every equivalent chat JID.
+
+    WhatsApp now routes many chats through a privacy LID instead of the
+    phone-number JID. whatsmeow keeps the LID<->phone-number mapping in
+    whatsmeow_lid_map (in the device store), so a contact's messages can be
+    filed under either identifier depending on when they arrived. This
+    resolves both directions so callers don't have to know which one was
+    used.
+    """
+    base = identifier.split('@')[0]
+    variants = {base}
+
+    try:
+        conn = sqlite3.connect(DEVICE_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map WHERE lid = ? OR pn = ?", (base, base))
+        for lid, pn in cursor.fetchall():
+            variants.add(lid)
+            variants.add(pn)
+    except sqlite3.Error as e:
+        print(f"Database error while resolving LID mapping: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    return list(variants)
 
 @dataclass
 class Message:
@@ -29,6 +58,7 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    is_read: Optional[bool] = None
 
     @property
     def is_group(self) -> bool:
@@ -164,12 +194,14 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
-            
+            variants = _resolve_jid_variants(sender_phone_number)
+            where_clauses.append("(" + " OR ".join(["messages.sender LIKE ?"] * len(variants)) + ")")
+            params.extend([f"{v}%" for v in variants])
+
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            variants = _resolve_jid_variants(chat_jid)
+            where_clauses.append("(" + " OR ".join(["messages.chat_jid LIKE ?"] * len(variants)) + ")")
+            params.extend([f"{v}@%" for v in variants])
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -330,13 +362,14 @@ def list_chats(
         
         # Build base query
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                chats.is_read
             FROM chats
         """]
         
@@ -376,12 +409,13 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                is_read=bool(chat_data[6]) if chat_data[6] is not None else None
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -444,23 +478,29 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
+        variants = _resolve_jid_variants(jid)
+        sender_match = " OR ".join(["m.sender LIKE ?"] * len(variants))
+        jid_match = " OR ".join(["c.jid LIKE ?"] * len(variants))
+        params = [f"{v}%" for v in variants] + [f"{v}@%" for v in variants]
+
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.is_read
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE ({sender_match}) OR ({jid_match})
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
-        
+        """, (*params, limit, page * limit))
+
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -469,12 +509,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                is_read=bool(chat_data[6]) if chat_data[6] is not None else None
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -489,8 +530,13 @@ def get_last_interaction(jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        variants = _resolve_jid_variants(jid)
+        sender_match = " OR ".join(["m.sender LIKE ?"] * len(variants))
+        jid_match = " OR ".join(["c.jid LIKE ?"] * len(variants))
+        params = [f"{v}%" for v in variants] + [f"{v}@%" for v in variants]
+
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -501,10 +547,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE ({sender_match}) OR ({jid_match})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, tuple(params))
         
         msg_data = cursor.fetchone()
         
@@ -539,37 +585,39 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         cursor = conn.cursor()
         
         query = """
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.is_read
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
-        
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_is_from_me=chat_data[5],
+            is_read=bool(chat_data[6]) if chat_data[6] is not None else None
         )
         
     except sqlite3.Error as e:
@@ -586,33 +634,39 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT 
+        variants = _resolve_jid_variants(sender_phone_number)
+        jid_match = " OR ".join(["c.jid LIKE ?"] * len(variants))
+        params = [f"{v}@%" for v in variants]
+
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                c.is_read
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE ({jid_match}) AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
-        
+        """, tuple(params))
+
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_is_from_me=chat_data[5],
+            is_read=bool(chat_data[6]) if chat_data[6] is not None else None
         )
         
     except sqlite3.Error as e:

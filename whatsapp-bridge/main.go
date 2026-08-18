@@ -64,9 +64,10 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			is_read BOOLEAN DEFAULT 1
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -90,6 +91,14 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migrate: add is_read to chats table if it doesn't exist yet (pre-existing databases)
+	if _, err := db.Exec("ALTER TABLE chats ADD COLUMN is_read BOOLEAN DEFAULT 1"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate chats table: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -98,11 +107,24 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database. Uses an upsert that only touches name and
+// last_message_time so it never clobbers is_read (which is tracked
+// separately from WhatsApp's own read-state sync).
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// SetChatReadStatus updates whether a chat is read or unread.
+func (store *MessageStore) SetChatReadStatus(jid string, isRead bool) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, is_read) VALUES (?, ?)
+		ON CONFLICT(jid) DO UPDATE SET is_read = excluded.is_read`,
+		jid, isRead,
 	)
 	return err
 }
@@ -423,6 +445,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// A message arriving from someone else makes the chat unread. Messages we
+	// send ourselves (e.g. from another linked device) don't change read state
+	// here - WhatsApp handles that via the MarkChatAsRead sync event.
+	if !msg.Info.IsFromMe {
+		if err := messageStore.SetChatReadStatus(chatJID, false); err != nil {
+			logger.Warnf("Failed to mark chat unread: %v", err)
+		}
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -641,7 +672,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -708,6 +739,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
+
+		// Sending into a chat implies you're looking at it - mark it read.
+		if success {
+			chatJID := req.Recipient
+			if !strings.Contains(chatJID, "@") {
+				chatJID = chatJID + "@s.whatsapp.net"
+			}
+			if err := messageStore.SetChatReadStatus(chatJID, true); err != nil {
+				fmt.Println("Failed to mark chat read after sending:", err)
+			}
+		}
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -800,14 +842,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -845,6 +887,14 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.MarkChatAsRead:
+			// Read/unread state changed from another device (e.g. you opened
+			// the chat on your phone)
+			isRead := v.Action != nil && v.Action.GetRead()
+			if err := messageStore.SetChatReadStatus(v.JID.String(), isRead); err != nil {
+				logger.Warnf("Failed to update read status for %s: %v", v.JID.String(), err)
+			}
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
@@ -871,6 +921,7 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				os.WriteFile("qr_raw.txt", []byte(evt.Code), 0644)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -924,10 +975,13 @@ func main() {
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real (resolved) name.
+	// A name that's just the raw JID user part (LID or phone number) means an
+	// earlier lookup fell back to it before the contact had synced - retry
+	// the resolution below instead of keeping that placeholder forever.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User && existingName != sender {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -973,7 +1027,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1042,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

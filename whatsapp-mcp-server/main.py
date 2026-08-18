@@ -85,6 +85,10 @@ def list_chats(
         page: Page number for pagination (default 0)
         include_last_message: Whether to include the last message in each chat (default True)
         sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+
+    Each chat includes an `is_read` field (true/false/null). It reflects WhatsApp's
+    own read state synced from your phone/other devices, updated live as chats are
+    opened or new messages arrive; null means the state hasn't been observed yet.
     """
     chats = whatsapp_list_chats(
         query=query,
