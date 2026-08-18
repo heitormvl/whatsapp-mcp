@@ -200,6 +200,10 @@ These tools now resolve both directions automatically using whatsmeow's own `wha
 
 Separately, the Go bridge previously cached a chat's display name the first time it saw a message from it — if that first message arrived before the contact's name had synced, the chat was stuck showing the raw number/LID forever. The bridge now retries the name lookup on subsequent messages if the stored name is still just the raw identifier.
 
+### Accent-Insensitive Name Search
+
+`search_contacts` and `list_chats`'s `query` filter previously used plain SQL `LIKE`, which is case-insensitive but **not accent-insensitive** - searching `Vinicius` would not match a contact saved as `Vinícius` because SQLite doesn't fold diacritics by default. Both now compare names through a `FOLD()` SQL function (a Python `unicodedata`-based normalizer registered on the connection) that strips accents before matching, so `search_contacts("Vinicius")` finds `Vinícius Magno` regardless of how the accent was typed.
+
 ### Read / Unread Status
 
 `list_chats`, `get_chat`, `get_contact_chats`, and `get_direct_chat_by_contact` include an `is_read` field (`true` / `false` / `null`). This mirrors WhatsApp's own read-state sync (`MarkChatAsRead` from whatsmeow), the same signal that keeps read status consistent across your phone and other linked devices — it isn't a heuristic. It updates live as: a new message arrives (marks the chat unread), you mark a chat as read/unread on another linked device, or you send a message through this MCP (marks the chat read). `null` means no read-state signal has been observed yet for that chat since the bridge started tracking it.

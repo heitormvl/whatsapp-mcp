@@ -1,4 +1,5 @@
 import sqlite3
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -10,6 +11,25 @@ import audio
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 DEVICE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _fold_accents(text: Optional[str]) -> str:
+    """Strip accents/diacritics and lowercase, so 'Vinicius' matches 'Vinícius'.
+
+    SQLite's LIKE has no accent folding built in, and contact/chat names
+    routinely carry accents while people search without typing them.
+    """
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c)).lower()
+
+
+def _connect() -> sqlite3.Connection:
+    """sqlite3 connection with an accent-insensitive FOLD() SQL function registered."""
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    conn.create_function("FOLD", 1, _fold_accents)
+    return conn
 
 def _resolve_jid_variants(identifier: str) -> List[str]:
     """Expand a phone number or JID into every equivalent chat JID.
@@ -357,9 +377,9 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["""
             SELECT
@@ -383,7 +403,7 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+            where_clauses.append("(FOLD(chats.name) LIKE FOLD(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
             
         if where_clauses:
@@ -427,19 +447,19 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        # Accent-insensitive: "Vinicius" must match a contact saved as "Vinícius"
+        search_pattern = '%' + query + '%'
+
         cursor.execute("""
-            SELECT DISTINCT 
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            WHERE
+                (FOLD(name) LIKE FOLD(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
